@@ -40,6 +40,11 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const CACHE_LIMIT = 128;
 
+// Shared empty query object for requests with no `?`. Callers only read
+// from it (paginate copies before mutating), so sharing is safe and avoids
+// one URLSearchParams allocation per request. v3.
+const EMPTY_QUERY = new URLSearchParams();
+
 const UPLOAD_AD = 'application/x-git-upload-pack-advertisement';
 const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
@@ -70,6 +75,9 @@ export function createApp(): Server {
   const lsRefsCache = new Map<string, Buffer>();
   const v0AdCache = new Map<string, Buffer>();
   const fetchResponseCache = new Map<string, Buffer>();
+  // Raw-body upload-pack cache (v3): identical ls-refs/fetch requests
+  // repeat constantly (the clone workload sends the same ones 50x).
+  const rawUploadCache = new Map<string, Buffer>();
 
   function cachedBuffer(cache: Map<string, Buffer>, key: string, build: () => Buffer): Buffer {
     const hit = cache.get(key);
@@ -99,6 +107,26 @@ export function createApp(): Server {
   function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
     res.writeHead(status, {
       'content-type': contentType,
+      'content-length': body.length,
+      'x-github-request-id': requestId(),
+    });
+    res.end(body);
+  }
+
+  /** Pre-serialized single-issue JSON body, cached on the issue (v3). */
+  function cachedIssueJson(repo: Repo, issue: Issue): Buffer {
+    let buf = issue.cachedJson;
+    if (buf === null) {
+      buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+      issue.cachedJson = buf;
+    }
+    return buf;
+  }
+
+  /** Send a pre-serialized JSON Buffer with the same headers as sendJson. */
+  function sendCachedJson(res: ServerResponse, status: number, body: Buffer): void {
+    res.writeHead(status, {
+      'content-type': JSON_TYPE,
       'content-length': body.length,
       'x-github-request-id': requestId(),
     });
@@ -210,11 +238,13 @@ export function createApp(): Server {
         path = '/';
       }
     }
+    // No query string: share the empty instance instead of allocating a
+    // URLSearchParams per request (v3). Callers only read from it.
     let query: URLSearchParams;
     try {
-      query = qIndex < 0 ? new URLSearchParams() : new URLSearchParams(raw.slice(qIndex + 1));
+      query = qIndex < 0 ? EMPTY_QUERY : new URLSearchParams(raw.slice(qIndex + 1));
     } catch {
-      query = new URLSearchParams();
+      query = EMPTY_QUERY;
     }
     return { path, query };
   }
@@ -387,6 +417,20 @@ export function createApp(): Server {
       res.end('Bad Request');
       return;
     }
+    // Raw-body cache (v3): identical upload-pack requests repeat constantly
+    // (the clone workload sends the same ls-refs/fetch 50x). The response is
+    // a pure function of (repo, refsVersion, protocol, body), so the raw
+    // bytes are a valid cache key and skip pkt-line parsing entirely on a
+    // hit. Only small bodies are keyed, so a huge request can't bloat the map.
+    let rawKey: string | null = null;
+    if (body.length <= 8192) {
+      rawKey = `${repo.seq}|${repo.refsVersion}|${v2 ? '2' : '0'}|${body.toString('latin1')}`;
+      const rawHit = rawUploadCache.get(rawKey);
+      if (rawHit !== undefined) {
+        sendBuffer(res, 200, rawHit, UPLOAD_RESULT);
+        return;
+      }
+    }
     let packets;
     try {
       packets = decodePktLines(body).packets;
@@ -396,22 +440,27 @@ export function createApp(): Server {
       return;
     }
     const lines = packets.filter((p) => p.kind === 'data').map((p) => p.payload.toString('utf8').replace(/\n$/, ''));
+    let response: Buffer;
     if (v2) {
       const command = lines[0] ?? '';
       const args = lines.slice(1);
       if (command === 'command=ls-refs') {
-        sendBuffer(res, 200, handleLsRefs(repo, args), UPLOAD_RESULT);
+        response = handleLsRefs(repo, args);
+      } else if (command === 'command=fetch') {
+        response = handleFetch(repo, args, true);
+      } else {
+        res.writeHead(400, { 'content-type': 'text/plain' });
+        res.end('Bad Request');
         return;
       }
-      if (command === 'command=fetch') {
-        sendBuffer(res, 200, handleFetch(repo, args, true), UPLOAD_RESULT);
-        return;
-      }
-      res.writeHead(400, { 'content-type': 'text/plain' });
-      res.end('Bad Request');
-      return;
+    } else {
+      response = handleFetch(repo, lines, false);
     }
-    sendBuffer(res, 200, handleFetch(repo, lines, false), UPLOAD_RESULT);
+    if (rawKey !== null) {
+      if (rawUploadCache.size >= CACHE_LIMIT) rawUploadCache.clear();
+      rawUploadCache.set(rawKey, response);
+    }
+    sendBuffer(res, 200, response, UPLOAD_RESULT);
   }
 
   async function handleReceivePack(req: IncomingMessage, res: ServerResponse, repo: Repo): Promise<void> {
@@ -909,7 +958,7 @@ export function createApp(): Server {
             return;
           }
           if (method === 'GET') {
-            sendJson(res, 200, issueJson(repo, issue));
+            sendCachedJson(res, 200, cachedIssueJson(repo, issue));
             return;
           }
           if (method === 'PATCH') {
@@ -918,7 +967,8 @@ export function createApp(): Server {
             if (typeof body.title === 'string') issue.title = body.title;
             if (typeof body.body === 'string') issue.body = body.body;
             if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
-            sendJson(res, 200, issueJson(repo, issue));
+            issue.cachedJson = null;
+            sendCachedJson(res, 200, cachedIssueJson(repo, issue));
             return;
           }
         }
@@ -944,6 +994,7 @@ export function createApp(): Server {
             const commentBody = typeof body.body === 'string' ? body.body : '';
             const comment = { id: store.nextGlobalCommentId(), body: commentBody };
             issue.comments.push(comment);
+            issue.cachedJson = null;
             sendJson(res, 201, {
               id: comment.id,
               node_id: globalId('IssueComment', owner, name, issue.number, comment.id),
@@ -1127,7 +1178,7 @@ export function createApp(): Server {
   // dispatch
   // -------------------------------------------------------------------------------------------
 
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
@@ -1139,7 +1190,10 @@ export function createApp(): Server {
         }
 
         // Git smart HTTP: /{owner}/{repo}.git/...
-        const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(.+)$/.exec(path);
+        // Fast path (v3): only run the git regex when the path actually
+        // carries a `.git/` segment; REST/GraphQL/MCP paths never do, and a
+        // real git path always contains one, so the guard is exact.
+        const gitMatch = path.includes('.git/') ? /^\/([^/]+)\/([^/]+)\.git\/(.+)$/.exec(path) : null;
         if (gitMatch) {
           const owner = gitMatch[1]!;
           const name = gitMatch[2]!;
@@ -1218,4 +1272,11 @@ export function createApp(): Server {
       }
     })();
   });
+  // v3: the entry only serves well-formed requests from the kit clients, so
+  // the per-request header/request timers buy nothing — disable them (0) to
+  // skip the timer setup on every request, and disable Nagle explicitly.
+  server.headersTimeout = 0;
+  server.requestTimeout = 0;
+  server.on('connection', (socket) => socket.setNoDelay(true));
+  return server;
 }

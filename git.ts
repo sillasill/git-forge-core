@@ -37,10 +37,15 @@ export function hashObject(type: GitObjectType, data: Uint8Array): string {
 export const PKT_LINE_MAX = 65520;
 
 export function pktLine(payload: string | Buffer): Buffer {
-  const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
+  // String payloads: build the length-prefixed line in one allocation
+  // instead of header + concat. The length is the UTF-8 byte length.
+  if (typeof payload === 'string') {
+    const len = Buffer.byteLength(payload, 'utf8') + 4;
+    return Buffer.from(`${len.toString(16).padStart(4, '0')}${payload}`, 'utf8');
+  }
   const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  header.write((payload.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  return Buffer.concat([header, payload]);
 }
 
 export const pktFlush = (): Buffer => Buffer.from('0000', 'ascii');

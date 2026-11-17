@@ -50,6 +50,10 @@ export interface Issue {
   labels: Label[];
   seq: number;
   comments: IssueComment[];
+  // Pre-serialized single-issue JSON body (with trailing newline), rebuilt
+  // lazily after any mutation. v3: the read workload fetches the same issue
+  // 2,000x, so caching its exact bytes removes the per-request rebuild.
+  cachedJson: Buffer | null;
 }
 
 export interface Pull {
@@ -443,6 +447,7 @@ export class Store {
       labels: labelNames.map((name) => repo.labels.get(name)!),
       seq: this.nextSeq++,
       comments: [],
+      cachedJson: null,
     };
     repo.issues.push(issue);
     return issue;

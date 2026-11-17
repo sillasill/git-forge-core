@@ -482,6 +482,7 @@ function resolveField(store: Store, obj: ResolverObject, field: FieldNode, error
         const issue = repo?.issues.find((i) => i.number === Number(decoded?.parts[2]));
         if (!issue || !repo) throw new FieldError(`Could not resolve to an Issue with the id of "${issueId ?? ''}".`);
         issue.state = 'closed';
+        issue.cachedJson = null;
         const child: ResolverObject = { __kind: 'CloseIssuePayload', repo, issue };
         return field.selections ? resolveSelections(store, child, field.selections, errors) : null;
       }
@@ -522,6 +523,7 @@ function resolveField(store: Store, obj: ResolverObject, field: FieldNode, error
         const body = stringOf(input.body) ?? '';
         const comment = { id: store.nextGlobalCommentId(), body };
         issue.comments.push(comment);
+        issue.cachedJson = null;
         const child: ResolverObject = { __kind: 'AddCommentPayload', repo, issue, comment };
         return field.selections ? resolveSelections(store, child, field.selections, errors) : null;
       }
