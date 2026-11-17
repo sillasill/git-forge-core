@@ -38,16 +38,47 @@ import { callMcpTool, handleMcpRequest, issueJson, pullJson, repoJson, rpcError,
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
+const CACHE_LIMIT = 128;
 
 const UPLOAD_AD = 'application/x-git-upload-pack-advertisement';
 const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+// The v2 advertisement never changes: the same six capability lines for
+// every repository. Build the bytes once and reuse them for every clone.
+const V2_ADVERTISEMENT = Buffer.concat([
+  ...[
+    'version 2\n',
+    'agent=github-core-clone/1.0.0\n',
+    'ls-refs=unborn\n',
+    'fetch=shallow wait-for-done\n',
+    'server-option\n',
+    'object-format=sha1\n',
+  ].map((line) => pktLine(line)),
+  pktFlush(),
+]);
+
 export function createApp(): Server {
   const store = new Store();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   let requestCounter = 0;
+
+  // Per-repository caches for advertisement and ls-refs responses. Every key
+  // carries the repo's refsVersion, so any ref mutation invalidates them;
+  // the payloads are otherwise pure functions of the request.
+  const lsRefsCache = new Map<string, Buffer>();
+  const v0AdCache = new Map<string, Buffer>();
+  const fetchResponseCache = new Map<string, Buffer>();
+
+  function cachedBuffer(cache: Map<string, Buffer>, key: string, build: () => Buffer): Buffer {
+    const hit = cache.get(key);
+    if (hit !== undefined) return hit;
+    const value = build();
+    if (cache.size >= CACHE_LIMIT) cache.clear();
+    cache.set(key, value);
+    return value;
+  }
 
   function requestId(): string {
     requestCounter += 1;
@@ -55,14 +86,14 @@ export function createApp(): Server {
   }
 
   function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
-    const text = `${JSON.stringify(body)}\n`;
+    const buf = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
     res.writeHead(status, {
       'content-type': JSON_TYPE,
-      'content-length': Buffer.byteLength(text),
+      'content-length': buf.length,
       'x-github-request-id': requestId(),
       ...extra,
     });
-    res.end(text);
+    res.end(buf);
   }
 
   function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
@@ -104,13 +135,28 @@ export function createApp(): Server {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let total = 0;
-      req.on('data', (chunk: Buffer) => {
+      // Fast path: a small body usually arrives buffered already; drain it
+      // synchronously instead of waiting for stream events.
+      let chunk: Buffer | null;
+      while ((chunk = req.read() as Buffer | null) !== null) {
         total += chunk.length;
         if (total > MAX_BODY_BYTES) {
           reject(new Error('request body too large'));
           return;
         }
         chunks.push(chunk);
+      }
+      if (req.complete) {
+        resolve(Buffer.concat(chunks));
+        return;
+      }
+      req.on('data', (c: Buffer) => {
+        total += c.length;
+        if (total > MAX_BODY_BYTES) {
+          reject(new Error('request body too large'));
+          return;
+        }
+        chunks.push(c);
       });
       req.on('end', () => resolve(Buffer.concat(chunks)));
       req.on('error', reject);
@@ -134,21 +180,43 @@ export function createApp(): Server {
     }
   }
 
-  function pathOf(req: IncomingMessage): string {
-    try {
-      const raw = new URL(req.url ?? '/', 'http://entry').pathname;
-      return decodeURIComponent(raw);
-    } catch {
-      return '/';
+  /**
+   * Split a request URL into its path and query with one parse instead of
+   * two `new URL` calls. The path is decoded only when it carries a `%`.
+   * Paths needing dot-segment normalisation fall back to `new URL`, so
+   * routing matches the old behaviour for every input.
+   */
+  function parseUrl(req: IncomingMessage): { path: string; query: URLSearchParams } {
+    const raw = req.url ?? '/';
+    const qIndex = raw.indexOf('?');
+    const pathRaw = qIndex < 0 ? raw : raw.slice(0, qIndex);
+    let path: string;
+    if (
+      pathRaw.includes('/./') ||
+      pathRaw.includes('/../') ||
+      pathRaw.includes('//') ||
+      pathRaw.endsWith('/.') ||
+      pathRaw.endsWith('/..')
+    ) {
+      try {
+        path = new URL(raw, 'http://entry').pathname;
+      } catch {
+        path = '/';
+      }
+    } else {
+      try {
+        path = pathRaw.includes('%') ? decodeURIComponent(pathRaw) : pathRaw;
+      } catch {
+        path = '/';
+      }
     }
-  }
-
-  function queryOf(req: IncomingMessage): URLSearchParams {
+    let query: URLSearchParams;
     try {
-      return new URL(req.url ?? '/', 'http://entry').searchParams;
+      query = qIndex < 0 ? new URLSearchParams() : new URLSearchParams(raw.slice(qIndex + 1));
     } catch {
-      return new URLSearchParams();
+      query = new URLSearchParams();
     }
+    return { path, query };
   }
 
   function baseUrlOf(req: IncomingMessage): string {
@@ -192,37 +260,35 @@ export function createApp(): Server {
   }
 
   function advertiseV2(res: ServerResponse): void {
-    const lines = [
-      'version 2\n',
-      'agent=github-core-clone/1.0.0\n',
-      'ls-refs=unborn\n',
-      'fetch=shallow wait-for-done\n',
-      'server-option\n',
-      'object-format=sha1\n',
-    ];
-    const body = Buffer.concat([...lines.map((line) => pktLine(line)), pktFlush()]);
-    sendBuffer(res, 200, body, UPLOAD_AD);
+    sendBuffer(res, 200, V2_ADVERTISEMENT, UPLOAD_AD);
   }
 
   function advertiseV0(res: ServerResponse, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): void {
-    const caps =
-      service === 'git-upload-pack'
-        ? 'symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta multi_ack_detailed shallow agent=github-core-clone/1.0.0'
-        : 'report-status side-band-64k delete-refs ofs-delta agent=github-core-clone/1.0.0';
-    const parts: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
-    const refs = store.listRefs(repo);
-    if (refs.length === 0) {
-      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-    } else {
-      const headTip = repo.refs.get('refs/heads/main') ?? refs.find((r) => r.name.startsWith('refs/heads/'))?.oid ?? ZERO_OID;
-      parts.push(pktLine(`${headTip} HEAD\0${caps}\n`));
-      for (const ref of refs) {
-        parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
-        if (ref.peeled) parts.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
-      }
-    }
-    parts.push(pktFlush());
-    sendBuffer(res, 200, Buffer.concat(parts), service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD);
+    const body = cachedBuffer(
+      v0AdCache,
+      `${repo.seq}|${service}|${repo.refsVersion}`,
+      () => {
+        const caps =
+          service === 'git-upload-pack'
+            ? 'symref=HEAD:refs/heads/main side-band-64k thin-pack ofs-delta multi_ack_detailed shallow agent=github-core-clone/1.0.0'
+            : 'report-status side-band-64k delete-refs ofs-delta agent=github-core-clone/1.0.0';
+        const parts: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
+        const refs = store.listRefs(repo);
+        if (refs.length === 0) {
+          parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+        } else {
+          const headTip = repo.refs.get('refs/heads/main') ?? refs.find((r) => r.name.startsWith('refs/heads/'))?.oid ?? ZERO_OID;
+          parts.push(pktLine(`${headTip} HEAD\0${caps}\n`));
+          for (const ref of refs) {
+            parts.push(pktLine(`${ref.oid} ${ref.name}\n`));
+            if (ref.peeled) parts.push(pktLine(`${ref.peeled} ${ref.name}^{}\n`));
+          }
+        }
+        parts.push(pktFlush());
+        return Buffer.concat(parts);
+      },
+    );
+    sendBuffer(res, 200, body, service === 'git-upload-pack' ? UPLOAD_AD : RECEIVE_AD);
   }
 
   function sidebandPack(pack: Buffer): Buffer[] {
@@ -236,25 +302,31 @@ export function createApp(): Server {
   }
 
   function handleLsRefs(repo: Repo, args: string[]): Buffer {
-    const prefixes: string[] = [];
-    for (const arg of args) {
-      if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
-    }
-    const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
-    const lines: Buffer[] = [];
-    const refs = store.listRefs(repo);
-    const headTip = repo.refs.get('refs/heads/main') ?? refs.find((r) => r.name.startsWith('refs/heads/'))?.oid;
-    if (headTip !== undefined && keep('HEAD')) {
-      lines.push(pktLine(`${headTip} HEAD symref-target:refs/heads/main\n`));
-    }
-    for (const ref of refs) {
-      if (!keep(ref.name)) continue;
-      let line = `${ref.oid} ${ref.name}`;
-      if (ref.peeled) line += ` peeled:${ref.peeled}`;
-      lines.push(pktLine(`${line}\n`));
-    }
-    lines.push(pktFlush());
-    return Buffer.concat(lines);
+    return cachedBuffer(
+      lsRefsCache,
+      `${repo.seq}|${args.join('\n')}|${repo.refsVersion}`,
+      () => {
+        const prefixes: string[] = [];
+        for (const arg of args) {
+          if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
+        }
+        const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => name.startsWith(prefix));
+        const lines: Buffer[] = [];
+        const refs = store.listRefs(repo);
+        const headTip = repo.refs.get('refs/heads/main') ?? refs.find((r) => r.name.startsWith('refs/heads/'))?.oid;
+        if (headTip !== undefined && keep('HEAD')) {
+          lines.push(pktLine(`${headTip} HEAD symref-target:refs/heads/main\n`));
+        }
+        for (const ref of refs) {
+          if (!keep(ref.name)) continue;
+          let line = `${ref.oid} ${ref.name}`;
+          if (ref.peeled) line += ` peeled:${ref.peeled}`;
+          lines.push(pktLine(`${line}\n`));
+        }
+        lines.push(pktFlush());
+        return Buffer.concat(lines);
+      },
+    );
   }
 
   function handleFetch(repo: Repo, args: string[], v2: boolean): Buffer {
@@ -272,29 +344,37 @@ export function createApp(): Server {
         if (Number.isFinite(n) && n > 0) depth = n;
       }
     }
-    const { pack, shallow, unshallow } = store.fetchResult(repo, wants, haves, depth, shallowBoundaries);
-    const parts: Buffer[] = [];
-    if (v2) {
-      parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim());
-      if (shallow.length > 0 || unshallow.length > 0) {
-        parts.push(pktLine('shallow-info\n'));
-        for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
-        for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-        parts.push(pktDelim());
-      }
-      if (pack !== null) {
-        parts.push(pktLine('packfile\n'));
-        parts.push(...sidebandPack(pack));
-      }
-      parts.push(pktFlush());
-    } else {
-      parts.push(pktLine('NAK\n'));
-      for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
-      for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-      if (pack !== null) parts.push(...sidebandPack(pack));
-      parts.push(pktFlush());
-    }
-    return Buffer.concat(parts);
+    // The framed response is a pure function of these arguments and the
+    // repo's objects (already content-addressed), so cache it whole.
+    return cachedBuffer(
+      fetchResponseCache,
+      [repo.seq, v2 ? '2' : '0', wants.join(','), haves.join(','), depth ?? '', shallowBoundaries.join(',')].join('|'),
+      () => {
+        const { pack, shallow, unshallow } = store.fetchResult(repo, wants, haves, depth, shallowBoundaries);
+        const parts: Buffer[] = [];
+        if (v2) {
+          parts.push(pktLine('acknowledgments\n'), pktLine('NAK\n'), pktDelim());
+          if (shallow.length > 0 || unshallow.length > 0) {
+            parts.push(pktLine('shallow-info\n'));
+            for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
+            for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+            parts.push(pktDelim());
+          }
+          if (pack !== null) {
+            parts.push(pktLine('packfile\n'));
+            parts.push(...sidebandPack(pack));
+          }
+          parts.push(pktFlush());
+        } else {
+          parts.push(pktLine('NAK\n'));
+          for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
+          for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
+          if (pack !== null) parts.push(...sidebandPack(pack));
+          parts.push(pktFlush());
+        }
+        return Buffer.concat(parts);
+      },
+    );
   }
 
   async function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo): Promise<void> {
@@ -397,6 +477,7 @@ export function createApp(): Server {
       if (current === undefined) return { ok: false, reason: 'remote ref does not exist' };
       if (command.oldOid !== ZERO_OID && command.oldOid !== current) return { ok: false, reason: 'old oid mismatch' };
       repo.refs.delete(command.ref);
+      repo.refsVersion += 1;
       return { ok: true };
     }
     const object = repo.objects.get(command.newOid);
@@ -404,6 +485,7 @@ export function createApp(): Server {
     if (current === undefined) {
       if (command.oldOid !== ZERO_OID) return { ok: false, reason: 'remote ref does not exist' };
       repo.refs.set(command.ref, command.newOid);
+      repo.refsVersion += 1;
       return { ok: true };
     }
     if (command.oldOid !== ZERO_OID && command.oldOid !== current) return { ok: false, reason: 'old oid mismatch' };
@@ -411,6 +493,7 @@ export function createApp(): Server {
     const newCommit = object.type === 'commit' ? command.newOid : parseTag(object.data).object;
     if (!store.isAncestor(repo, current, newCommit)) return { ok: false, reason: 'non-fast-forward' };
     repo.refs.set(command.ref, command.newOid);
+    repo.refsVersion += 1;
     return { ok: true };
   }
 
@@ -610,6 +693,7 @@ export function createApp(): Server {
             return;
           }
           repo.refs.set(ref, sha);
+          repo.refsVersion += 1;
           sendJson(res, 201, { ref, object: { sha } });
           return;
         }
@@ -684,7 +768,10 @@ export function createApp(): Server {
           // A branch that does not exist yet starts from the default branch's tip.
           if (repo.refs.get(`refs/heads/${branch}`) === undefined) {
             const defaultTip = repo.refs.get(`refs/heads/${repo.default_branch}`);
-            if (defaultTip !== undefined) repo.refs.set(`refs/heads/${branch}`, defaultTip);
+            if (defaultTip !== undefined) {
+              repo.refs.set(`refs/heads/${branch}`, defaultTip);
+              repo.refsVersion += 1;
+            }
           }
           // Resolve the branch's current tree to decide create vs update.
           const branchTip = repo.refs.get(`refs/heads/${branch}`);
@@ -1044,8 +1131,7 @@ export function createApp(): Server {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
-        const path = pathOf(req);
-        const query = queryOf(req);
+        const { path, query } = parseUrl(req);
 
         if (method === 'GET' && path === '/healthz') {
           sendJson(res, 200, { ok: true });

@@ -78,6 +78,8 @@ export interface Repo {
   default_branch: string;
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
+  /** Bumped on every refs mutation; response caches key on it. */
+  refsVersion: number;
   issues: Issue[];
   pulls: Pull[];
   labels: Map<string, Label>;
@@ -151,6 +153,7 @@ export class Store {
       default_branch: 'main',
       objects: new Map(),
       refs: new Map(),
+      refsVersion: 0,
       issues: [],
       pulls: [],
       labels: new Map(),
@@ -401,6 +404,7 @@ export class Store {
     const commitData = buildCommit({ tree: treeOid, parents, message, author: AUTHOR_LINE, committer: AUTHOR_LINE });
     const commitSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(ref, commitSha);
+    repo.refsVersion += 1;
     return { commitSha, contentSha: blobOid };
   }
 
@@ -418,6 +422,7 @@ export class Store {
     const commitData = buildCommit({ tree: treeOid, parents: [tip], message, author: AUTHOR_LINE, committer: AUTHOR_LINE });
     const commitSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(ref, commitSha);
+    repo.refsVersion += 1;
     return { commitSha };
   }
 
@@ -546,6 +551,7 @@ export class Store {
     const commitData = buildCommit({ tree: headTree, parents: [baseSha], message, author: AUTHOR_LINE, committer: AUTHOR_LINE });
     const mergeSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+    repo.refsVersion += 1;
     pull.state = 'closed';
     pull.merged = true;
     pull.merged_at = FIXED_ISO;
